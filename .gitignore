@@ -12,6 +12,7 @@ generated
 
 # C extensions
 *.so
+*.dSYM
 
 # Packages
 *.egg
@@ -84,3 +85,6 @@ nosetests.xml
 Icon?
 ehthumbs.db
 Thumbs.db
+
+# Emacs
+*~

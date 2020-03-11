@@ -2,38 +2,29 @@
 # encoding: utf-8
 """
 ccblade.py
-
 Created by S. Andrew Ning on 5/11/2012
 Copyright (c) NREL. All rights reserved.
-
 A blade element momentum method using theory detailed in [1]_.  Has the
 advantages of guaranteed convergence and at a superlinear rate, and
 continuously differentiable output.
-
 .. [1] S. Andrew Ning, "A simple solution method for the blade element momentum
 equations with guaranteed convergence", Wind Energy, 2013.
-
-
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-
    http://www.apache.org/licenses/LICENSE-2.0
-
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-
 """
 
+from __future__ import print_function
 import numpy as np
-from math import pi, radians, sin, cos
+from math import pi, radians, sin, cos, isnan
 from scipy.optimize import brentq
 from scipy.interpolate import RectBivariateSpline, bisplev
-from zope.interface import Interface, implements
 import warnings
 
 from airfoilprep import Airfoil
@@ -42,52 +33,17 @@ import _bem
 
 
 # ------------------
-#  Interfaces
-# ------------------
-
-
-class AirfoilInterface(Interface):
-    """Interface for airfoil aerodynamic analysis."""
-
-    def evaluate(alpha, Re):
-        """Get lift/drag coefficient at the specified angle of attack and Reynolds number
-
-        Parameters
-        ----------
-        alpha : float (rad)
-            angle of attack
-        Re : float
-            Reynolds number
-
-        Returns
-        -------
-        cl : float
-            lift coefficient
-        cd : float
-            drag coefficient
-
-        Notes
-        -----
-        Any implementation can be used, but to keep the smooth properties
-        of CCBlade, the implementation should be C1 continuous.
-
-        """
-
-
-# ------------------
 #  Airfoil Class
 # ------------------
 
 
-class CCAirfoil:
+class CCAirfoil(object):
     """A helper class to evaluate airfoil data using a continuously
     differentiable cubic spline"""
-    implements(AirfoilInterface)
 
 
-    def __init__(self, alpha, Re, cl, cd):
+    def __init__(self, alpha, Re, cl, cd, cm=[]):
         """Setup CCAirfoil from raw airfoil data on a grid.
-
         Parameters
         ----------
         alpha : array_like (deg)
@@ -102,17 +58,24 @@ class CCAirfoil:
         cd : array_like
             drag coefficient 2-D array with shape (alpha.size, Re.size)
             cd[i, j] is the drag coefficient at alpha[i] and Re[j]
-
         """
 
         alpha = np.radians(alpha)
         self.one_Re = False
+
+        if len(cm) > 0:
+            self.use_cm = True
+        else:
+            self.use_cm = False
 
         # special case if zero or one Reynolds number (need at least two for bivariate spline)
         if len(Re) < 2:
             Re = [1e1, 1e15]
             cl = np.c_[cl, cl]
             cd = np.c_[cd, cd]
+            if self.use_cm:
+                cm = np.c_[cm, cm]
+
             self.one_Re = True
 
         kx = min(len(alpha)-1, 3)
@@ -121,57 +84,128 @@ class CCAirfoil:
         # a small amount of smoothing is used to prevent spurious multiple solutions
         self.cl_spline = RectBivariateSpline(alpha, Re, cl, kx=kx, ky=ky, s=0.1)
         self.cd_spline = RectBivariateSpline(alpha, Re, cd, kx=kx, ky=ky, s=0.001)
+        self.alpha     = alpha
+
+        if self.use_cm > 0:
+            self.cm_spline = RectBivariateSpline(alpha, Re, cm, kx=kx, ky=ky, s=0.0001)
 
 
     @classmethod
     def initFromAerodynFile(cls, aerodynFile):
         """convenience method for initializing with AeroDyn formatted files
-
         Parameters
         ----------
         aerodynFile : str
             location of AeroDyn style airfoiil file
-
         Returns
         -------
         af : CCAirfoil
             a constructed CCAirfoil object
-
         """
 
         af = Airfoil.initFromAerodynFile(aerodynFile)
         alpha, Re, cl, cd, cm = af.createDataGrid()
-        return cls(alpha, Re, cl, cd)
+        return cls(alpha, Re, cl, cd, cm=cm)
+
+    
+    def max_eff(self, Re):
+        # Get the angle of attack, cl and cd at max airfoil efficiency. For a cylinder, set the angle of attack to 0
+        
+        Eff         = np.zeros_like(self.alpha)
+        
+        # Check efficiency only between -20 and +40 deg
+        aoa_start   = -20.
+        aoa_end     = 40
+        i_start     = np.argmin(abs(self.alpha - (aoa_start * np.pi / 180.)))
+        i_end       = np.argmin(abs(self.alpha - (aoa_end * np.pi / 180.)))
+
+        if len(self.alpha[i_start:i_end]) == 0: # Cylinder
+            alpha_Emax  = 0.
+            cl_Emax     = self.cl_spline.ev(alpha_Emax, Re)
+            cd_Emax     = self.cd_spline.ev(alpha_Emax, Re)
+            Emax = cl_Emax/cd_Emax
+
+        else:
+            alpha = np.linspace(aoa_start*np.pi/180., aoa_end*np.pi/180., num=201)
+            cl = [self.cl_spline.ev(aoa, Re) for aoa in alpha]
+            cd = [self.cd_spline.ev(aoa, Re) for aoa in alpha]
+            Eff = [cli/cdi for cli, cdi, in zip(cl, cd)]
+
+            i_max = np.argmax(Eff)
+            alpha_Emax  = alpha[i_max]
+            cl_Emax     = cl[i_max]
+            cd_Emax     = cd[i_max]
+            Emax        = Eff[i_max]
+
+        # print Emax, alpha_Emax*180./np.pi, cl_Emax, cd_Emax
+
+        return Emax, alpha_Emax, cl_Emax, cd_Emax
+        
+        
+    def awayfromstall(self, Re, margin):
+        # Get the angle of attack, cl and cd with a margin (in degrees) from the stall point. For a cylinder, set the angle of attack to 0 deg
+        
+        # Eff         = np.zeros_like(self.alpha)
+        
+        # Look for stall only between -20 and +40 deg
+        aoa_start   = -20.
+        aoa_end     = 40
+        i_start     = np.argmin(abs(self.alpha - (aoa_start * np.pi / 180.)))
+        i_end       = np.argmin(abs(self.alpha - (aoa_end * np.pi / 180.)))
+
+        if len(self.alpha[i_start:i_end]) == 0: # Cylinder
+            alpha_op   = 0.
+
+        else:
+            alpha   = np.linspace(aoa_start*np.pi/180., aoa_end*np.pi/180., num=201)
+            cl      = [self.cl_spline.ev(aoa, Re) for aoa in alpha]
+            cd      = [self.cd_spline.ev(aoa, Re) for aoa in alpha]
+            
+            i_stall = np.argmax(cl)
+            alpha_stall  = alpha[i_stall]
+            alpha_op     = alpha_stall - margin*np.pi/180.
+        
+        cl_op      = self.cl_spline.ev(alpha_op, Re)
+        cd_op      = self.cd_spline.ev(alpha_op, Re)
+        Eff_op     = cl_op/cd_op
+            
+            
+        # print Emax, alpha_Emax*180./np.pi, cl_Emax, cd_Emax
+
+        return Eff_op, alpha_op, cl_op, cd_op
+        
+        
+        
 
 
-    def evaluate(self, alpha, Re):
+    def evaluate(self, alpha, Re, return_cm=False):
         """Get lift/drag coefficient at the specified angle of attack and Reynolds number.
-
         Parameters
         ----------
         alpha : float (rad)
             angle of attack
         Re : float
             Reynolds number
-
         Returns
         -------
         cl : float
             lift coefficient
         cd : float
             drag coefficient
-
         Notes
         -----
         This method uses a spline so that the output is continuously differentiable, and
         also uses a small amount of smoothing to help remove spurious multiple solutions.
-
         """
 
         cl = self.cl_spline.ev(alpha, Re)
         cd = self.cd_spline.ev(alpha, Re)
 
-        return cl, cd
+        if self.use_cm and return_cm:
+            cm = self.cm_spline.ev(alpha, Re)
+            return cl, cd, cm
+        else:
+            return cl, cd
 
 
     def derivatives(self, alpha, Re):
@@ -193,20 +227,178 @@ class CCAirfoil:
         return dcl_dalpha, dcl_dRe, dcd_dalpha, dcd_dRe
 
 
+    def eval_unsteady(self, alpha, cl, cd, cm):
+        # calculate unsteady coefficients from polars for OpenFAST's Aerodyn
+
+        unsteady = {}
+
+        alpha_rad = np.radians(alpha)
+        cn = cl*np.cos(alpha_rad) + cd*np.sin(alpha_rad)
+
+        # alpha0, Cd0, Cm0
+        aoa_l = [-30.]
+        aoa_h = [30.]
+        idx_low  = np.argmin(abs(alpha-aoa_l))
+        idx_high = np.argmin(abs(alpha-aoa_h))
+
+        if max(np.abs(np.gradient(cl)))>0.:
+            unsteady['alpha0'] = np.interp(0., cl[idx_low:idx_high], alpha[idx_low:idx_high])
+            unsteady['Cd0'] = np.interp(0., cl[idx_low:idx_high], cd[idx_low:idx_high])
+            unsteady['Cm0'] = np.interp(0., cl[idx_low:idx_high], cm[idx_low:idx_high])
+        else:
+            unsteady['alpha0'] = 0.
+            unsteady['Cd0'] = cd[np.argmin(abs(alpha-0.))]
+            unsteady['Cm0'] = 0.
+
+
+        unsteady['eta_e']= 1
+        unsteady['T_f0'] = "Default"
+        unsteady['T_V0'] = "Default"
+        unsteady['T_p']  = "Default"
+        unsteady['T_VL'] = "Default"
+        unsteady['b1']   = "Default"
+        unsteady['b2']   = "Default"
+        unsteady['b5']   = "Default"
+        unsteady['A1']   = "Default"
+        unsteady['A2']   = "Default"
+        unsteady['A5']   = "Default"
+        unsteady['S1']   = 0
+        unsteady['S2']   = 0
+        unsteady['S3']   = 0
+        unsteady['S4']   = 0
+
+        def find_breakpoint(x, y, idx_low, idx_high, multi=1.):
+            lin_fit = np.interp(x[idx_low:idx_high], [x[idx_low],x[idx_high]], [y[idx_low],y[idx_high]])
+            idx_break = 0
+            lin_diff = 0
+            for i, (fit, yi) in enumerate(zip(lin_fit, y[idx_low:idx_high])):
+                if multi==0:
+                    diff_i = np.abs(yi-fit)
+                else:
+                    diff_i = multi*(yi-fit)
+                if diff_i>lin_diff:
+                    lin_diff = diff_i
+                    idx_break = i
+            idx_break += idx_low
+            return idx_break
+
+        # Cn1
+        idx_alpha0  = np.argmin(abs(alpha-unsteady['alpha0']))
+        
+        if max(np.abs(np.gradient(cm)))>1.e-10:
+            aoa_h = alpha[idx_alpha0]+35.
+            idx_high = np.argmin(abs(alpha-aoa_h))
+
+            cm_temp = cm[idx_low:idx_high]
+            idx_cm_min = [i for i,local_min in enumerate(np.r_[True, cm_temp[1:] < cm_temp[:-1]] & np.r_[cm_temp[:-1] < cm_temp[1:], True]) if local_min] + idx_low
+            idx_high = idx_cm_min[-1]
+            
+            
+            idx_Cn1 = find_breakpoint(alpha, cm, idx_alpha0, idx_high)
+            unsteady['Cn1'] = cn[idx_Cn1]
+        else:
+            idx_Cn1 = np.argmin(abs(alpha-0.))
+            unsteady['Cn1'] = 0.
+        
+
+        
+        # Cn2
+        if max(np.abs(np.gradient(cm)))>1.e-10:
+            aoa_l = np.mean([alpha[idx_alpha0], alpha[idx_Cn1]])-30.
+            idx_low  = np.argmin(abs(alpha-aoa_l))
+
+            cm_temp = cm[idx_low:idx_high]
+            idx_cm_min = [i for i,local_min in enumerate(np.r_[True, cm_temp[1:] < cm_temp[:-1]] & np.r_[cm_temp[:-1] < cm_temp[1:], True]) if local_min] + idx_low
+            idx_high = idx_cm_min[-1]
+            
+            idx_Cn2 = find_breakpoint(alpha, cm, idx_low, idx_alpha0, multi=0.)
+            unsteady['Cn2'] = cn[idx_Cn2]
+        else:
+            idx_Cn2 = np.argmin(abs(alpha-0.))
+            unsteady['Cn2'] = 0.
+
+        # C_nalpha
+        if max(np.abs(np.gradient(cm)))>1.e-10:
+            # unsteady['C_nalpha'] = np.gradient(cn, alpha_rad)[idx_alpha0]
+            unsteady['C_nalpha'] = max(np.gradient(cn[idx_alpha0:idx_Cn1], alpha_rad[idx_alpha0:idx_Cn1]))
+
+        else:
+            unsteady['C_nalpha'] = 0.
+
+        # alpha1, alpha2
+        # finding the break point in drag as a proxy for Trailing Edge separation, f=0.7
+        # 3d stall corrections cause erroneous f calculations 
+        if max(np.abs(np.gradient(cm)))>1.0e-10:
+            aoa_l = [0.]
+            idx_low  = np.argmin(abs(alpha-aoa_l))
+            idx_alpha1 = find_breakpoint(alpha, cd, idx_low, idx_Cn1, multi=-1.)
+            unsteady['alpha1'] = alpha[idx_alpha1]
+        else:
+            idx_alpha1 = np.argmin(abs(alpha-0.))
+            unsteady['alpha1'] = 0.
+        unsteady['alpha2'] = -1.*unsteady['alpha1']
+
+
+        unsteady['St_sh']   = "Default"
+        unsteady['k0']      = 0
+        unsteady['k1']      = 0
+        unsteady['k2']      = 0
+        unsteady['k3']      = 0
+        unsteady['k1_hat']  = 0
+        unsteady['x_cp_bar']   = "Default"
+        unsteady['UACutout']   = "Default"
+        unsteady['filtCutOff'] = "Default"
+
+        unsteady['Alpha']    = alpha
+        unsteady['Cl']    = cl
+        unsteady['Cd']    = cd
+        unsteady['Cm']    = cm
+
+        self.unsteady = unsteady
+
+        # import matplotlib.pyplot as plt
+        # fig, ax = plt.subplots(nrows=3, ncols=1, figsize=(6., 8.), sharex=True)
+        # ax[0].plot(alpha, cn)
+        # ax[0].plot(alpha, cl, '--')
+        # ax[0].plot(unsteady['alpha0'], 0.,'o')
+        # ax[0].annotate('alpha0', (unsteady['alpha0'], 0.))
+        # ax[0].plot(alpha[idx_alpha0], cn[idx_alpha0],'o')
+        # ax[0].annotate('C_nalpha', (alpha[idx_alpha0], cn[idx_alpha0]))
+        # ax[0].plot(alpha[idx_Cn1], cn[idx_Cn1],'o')
+        # ax[0].annotate('Cn1', (alpha[idx_Cn1], cn[idx_Cn1]))
+        # ax[0].plot(alpha[idx_Cn2], cn[idx_Cn2],'o')
+        # ax[0].annotate('Cn2', (alpha[idx_Cn2], cn[idx_Cn2]))
+        # ax[0].set_ylabel('C_L')
+        # ax[0].grid(True, linestyle=':')
+
+        # ax[1].plot(alpha, cd)
+        # ax[1].set_ylabel('C_D')
+        # ax[1].grid(True, linestyle=':')
+
+        # ax[2].plot(alpha, cm)
+        # ax[2].plot(alpha[idx_Cn1], cm[idx_Cn1], 'o')
+        # ax[2].annotate('Cn1', (alpha[idx_Cn1], cm[idx_Cn1]))
+        # ax[2].plot(alpha[idx_Cn2], cm[idx_Cn2], 'o')
+        # ax[2].annotate('Cn2', (alpha[idx_Cn2], cm[idx_Cn2]))
+
+        # ax[2].set_ylabel('C_M')
+        # ax[2].set_xlabel('Angle of Attack, deg')
+        # ax[2].grid(True, linestyle=':')
+
+        # plt.show()
 
 # ------------------
 #  Main Class: CCBlade
 # ------------------
 
 
-class CCBlade:
+class CCBlade(object):
 
     def __init__(self, r, chord, theta, af, Rhub, Rtip, B=3, rho=1.225, mu=1.81206e-5,
                  precone=0.0, tilt=0.0, yaw=0.0, shearExp=0.2, hubHt=80.0,
                  nSector=8, precurve=None, precurveTip=0.0, presweep=None, presweepTip=0.0,
                  tiploss=True, hubloss=True, wakerotation=True, usecd=True, iterRe=1, derivatives=False):
         """Constructor for aerodynamic rotor analysis
-
         Parameters
         ----------
         r : array_like (m)
@@ -217,8 +409,6 @@ class CCBlade:
         theta : array_like (deg)
             corresponding :ref:`twist angle <blade_airfoil_coord>` at each section---
             positive twist decreases angle of attack.
-        af : list(AirfoilInterface)
-            list of :ref:`AirfoilInterface <airfoil-interface-label>` objects at each section
         Rhub : float (m)
             location of hub
         Rtip : float (m)
@@ -269,7 +459,6 @@ class CCBlade:
             should not be necessary.  Gradients have only been implemented for the case iterRe=1.
         derivatives : boolean, optional
             if True, derivatives along with function values will be returned for the various methods
-
         """
 
         self.r = np.array(r)
@@ -289,7 +478,8 @@ class CCBlade:
         self.bemoptions = dict(usecd=usecd, tiploss=tiploss, hubloss=hubloss, wakerotation=wakerotation)
         self.iterRe = iterRe
         self.derivatives = derivatives
-
+        
+        
         # check if no precurve / presweep
         if precurve is None:
             precurve = np.zeros(len(r))
@@ -318,17 +508,47 @@ class CCBlade:
             self.nSector = max(4, nSector)  # at least 4 are necessary
 
 
+        self.inverse_analysis = False
+        self.induction        = False
+        self.induction_inflow = False
+
     # residual
     def __runBEM(self, phi, r, chord, theta, af, Vx, Vy):
         """residual of BEM method and other corresponding variables"""
 
         a = 0.0
         ap = 0.0
+        
+        
+        
         for i in range(self.iterRe):
 
             alpha, W, Re = _bem.relativewind(phi, a, ap, Vx, Vy, self.pitch,
                                              chord, theta, self.rho, self.mu)
             cl, cd = af.evaluate(alpha, Re)
+            
+            fzero, a, ap = _bem.inductionfactors(r, chord, self.Rhub, self.Rtip, phi,
+                                                 cl, cd, self.B, Vx, Vy, **self.bemoptions)
+
+        
+        return fzero, a, ap
+
+    def __errorFunction(self, phi, r, chord, theta, af, Vx, Vy):
+        """strip other outputs leaving only residual for Brent's method
+        Standard use case, geometry is known
+        """
+
+        fzero, a, ap = self.__runBEM(phi, r, chord, theta, af, Vx, Vy)
+
+        return fzero
+
+    def __runBEM_inverse(self, phi, r, chord, cl, cd, af, Vx, Vy):
+        """residual of BEM method and other corresponding variables
+        """
+
+        a = 0.0
+        ap = 0.0
+        for i in range(self.iterRe):
 
             fzero, a, ap = _bem.inductionfactors(r, chord, self.Rhub, self.Rtip, phi,
                                                  cl, cd, self.B, Vx, Vy, **self.bemoptions)
@@ -336,10 +556,12 @@ class CCBlade:
         return fzero, a, ap
 
 
-    def __errorFunction(self, phi, r, chord, theta, af, Vx, Vy):
-        """strip other outputs leaving only residual for Brent's method"""
+    def __errorFunction_inverse(self, phi, r, chord, cl, cd, af, Vx, Vy):
+        """strip other outputs leaving only residual for Brent's method
+        Parametric optimization use case, desired Cl/Cd is known, solve for twist
+        """
 
-        fzero, a, ap = self.__runBEM(phi, r, chord, theta, af, Vx, Vy)
+        fzero, a, ap = self.__runBEM_inverse(phi, r, chord, cl, cd, af, Vx, Vy)
 
         return fzero
 
@@ -392,10 +614,10 @@ class CCBlade:
         else:
             a = 0.0
             ap = 0.0
-
-        alpha, W, Re = _bem.relativewind(phi, a, ap, Vx, Vy, self.pitch,
+                
+        alpha_rad, W, Re = _bem.relativewind(phi, a, ap, Vx, Vy, self.pitch,
                                          chord, theta, self.rho, self.mu)
-        cl, cd = af.evaluate(alpha, Re)
+        cl, cd = af.evaluate(alpha_rad, Re)
 
         cn = cl*cphi + cd*sphi  # these expressions should always contain drag
         ct = cl*sphi - cd*cphi
@@ -404,9 +626,10 @@ class CCBlade:
         Np = cn*q*chord
         Tp = ct*q*chord
 
-
+        alpha_deg = alpha_rad * 180. / np.pi
+        
         if not self.derivatives:
-            return Np, Tp, 0.0, 0.0, 0.0
+            return a, ap, Np, Tp, alpha_deg, cl, cd, 0.0, 0.0, 0.0
 
 
         # derivative of residual function
@@ -426,13 +649,13 @@ class CCBlade:
 
         # alpha, W, Re (Tapenade)
 
-        alpha, dalpha_dx, W, dW_dx, Re, dRe_dx = _bem.relativewind_dv(phi, dx_dx[0, :],
+        alpha_rad, dalpha_dx, W, dW_dx, Re, dRe_dx = _bem.relativewind_dv(phi, dx_dx[0, :],
             a, da_dx, ap, dap_dx, Vx, dx_dx[3, :], Vy, dx_dx[4, :],
             self.pitch, dx_dx[8, :], chord, dx_dx[1, :], theta, dx_dx[2, :],
             self.rho, self.mu)
 
         # cl, cd (spline derivatives)
-        dcl_dalpha, dcl_dRe, dcd_dalpha, dcd_dRe = af.derivatives(alpha, Re)
+        dcl_dalpha, dcl_dRe, dcd_dalpha, dcd_dRe = af.derivatives(alpha_rad, Re)
 
         # chain rule
         dcl_dx = dcl_dalpha*dalpha_dx + dcl_dRe*dRe_dx
@@ -445,8 +668,10 @@ class CCBlade:
         # Np, Tp
         dNp_dx = Np*(1.0/cn*dcn_dx + 2.0/W*dW_dx + 1.0/chord*dchord_dx)
         dTp_dx = Tp*(1.0/ct*dct_dx + 2.0/W*dW_dx + 1.0/chord*dchord_dx)
-
-        return Np, Tp, dNp_dx, dTp_dx, dR_dx
+        
+        alpha_deg = alpha_rad * 180. / np.pi
+        
+        return a, ap, Np, Tp, alpha_deg, cl, cd, dNp_dx, dTp_dx, dR_dx
 
 
 
@@ -489,7 +714,6 @@ class CCBlade:
 
     def distributedAeroLoads(self, Uinf, Omega, pitch, azimuth):
         """Compute distributed aerodynamic loads along blade.
-
         Parameters
         ----------
         Uinf : float or array_like (m/s)
@@ -503,7 +727,6 @@ class CCBlade:
             (positive decreases angle of attack)
         azimuth : float (deg)
             the :ref:`azimuth angle <hub_azimuth_coord>` where aerodynamic loads should be computed at
-
         Returns
         -------
         Np : ndarray (N/m)
@@ -513,13 +736,9 @@ class CCBlade:
         dNp : dictionary containing arrays (present if ``self.derivatives = True``)
             derivatives of normal loads.  Each item in the dictionary a 2D Jacobian.
             The array sizes and keys are (where n = number of stations along blade):
-
             n x n (diagonal): 'dr', 'dchord', 'dtheta', 'dpresweep'
-
             n x n (tridiagonal): 'dprecurve'
-
             n x 1: 'dRhub', 'dRtip', 'dprecone', 'dtilt', 'dhubHt', 'dyaw', 'dazimuth', 'dUinf', 'dOmega', 'dpitch'
-
             for example dNp_dr = dNp['dr']  (where dNp_dr is an n x n array)
             and dNp_dr[i, j] = dNp_i / dr_j
         dTp : dictionary (present if ``self.derivatives = True``)
@@ -534,7 +753,12 @@ class CCBlade:
 
 
         # initialize
-        n = len(self.r)
+        n  = len(self.r)
+        a  = np.zeros(n)
+        ap = np.zeros(n)
+        alpha = np.zeros(n)
+        cl = np.zeros(n)
+        cd = np.zeros(n)
         Np = np.zeros(n)
         Tp = np.zeros(n)
 
@@ -545,14 +769,21 @@ class CCBlade:
         dNp_dz = np.zeros((6, n))
         dTp_dz = np.zeros((6, n))
 
-        errf = self.__errorFunction
+        if self.inverse_analysis == True:
+            errf = self.__errorFunction_inverse
+            self.theta = np.zeros_like(self.r)
+        else:
+            errf = self.__errorFunction
         rotating = (Omega != 0)
 
         # ---------------- loop across blade ------------------
         for i in range(n):
 
             # index dependent arguments
-            args = (self.r[i], self.chord[i], self.theta[i], self.af[i], Vx[i], Vy[i])
+            if self.inverse_analysis == True:
+                args = (self.r[i], self.chord[i], self.cl[i], self.cd[i], self.af[i], Vx[i], Vy[i])
+            else:
+                args = (self.r[i], self.chord[i], self.theta[i], self.af[i], Vx[i], Vy[i])
 
             if not rotating:  # non-rotating
 
@@ -586,9 +817,21 @@ class CCBlade:
 
                 # ----------------------------------------------------------------
 
+            if self.inverse_analysis == True:
+                self.theta[i]   = phi_star - self.alpha[i] - self.pitch # rad
+                args = (self.r[i], self.chord[i], self.theta[i], self.af[i], Vx[i], Vy[i])
+
             # derivatives of residual
 
-            Np[i], Tp[i], dNp_dx, dTp_dx, dR_dx = self.__loads(phi_star, rotating, *args)
+            a[i], ap[i], Np[i], Tp[i], alpha[i], cl[i], cd[i], dNp_dx, dTp_dx, dR_dx = self.__loads(phi_star, rotating, *args)
+
+            if isnan(Np[i]):
+                a[i]     = 0.
+                ap[i]    = 0.
+                Np[i]    = 0.
+                Tp[i]    = 0.
+                alpha[i] = 0.
+                # print('warning, BEM convergence error, setting Np[%d] = Tp[%d] = 0.' % (i,i))
 
             if self.derivatives:
                 # separate state vars from design vars
@@ -617,9 +860,13 @@ class CCBlade:
                 dTp_dVy[i] = DTp_Dx[3]
 
 
-
         if not self.derivatives:
-            return Np, Tp
+            if self.induction:
+                return a, ap, Np, Tp
+            elif self.induction_inflow:
+                return a, ap, alpha, cl, cd
+            else:
+                return Np, Tp
 
         else:
 
@@ -697,9 +944,8 @@ class CCBlade:
 
 
 
-    def evaluate(self, Uinf, Omega, pitch, coefficient=False):
+    def evaluate(self, Uinf, Omega, pitch, coefficients=False):
         """Run the aerodynamic analysis at the specified conditions.
-
         Parameters
         ----------
         Uinf : array_like (m/s)
@@ -710,7 +956,6 @@ class CCBlade:
             blade pitch setting
         coefficient : bool, optional
             if True, results are returned in nondimensional form
-
         Returns
         -------
         P or CP : ndarray (W)
@@ -724,33 +969,22 @@ class CCBlade:
             The array sizes and keys are below
             npts is the number of conditions (len(Uinf)),
             n = number of stations along blade (len(r))
-
             npts x 1: 'dprecone', 'dtilt', 'dhubHt', 'dRhub', 'dRtip', 'dprecurveTip', 'dpresweepTip', 'dyaw'
-
             npts x npts: 'dUinf', 'dOmega', 'dpitch'
-
             npts x n: 'dr', 'dchord', 'dtheta', 'dprecurve', 'dpresweep'
-
             for example dP_dr = dP['dr']  (where dP_dr is an npts x n array)
             and dP_dr[i, j] = dP_i / dr_j
         dT or dCT : dictionary of arrays (present only if derivatives==True)
             derivative of thrust or thrust coefficient.  Same format as dP and dCP
         dQ or dCQ : dictionary of arrays (present only if derivatives==True)
             derivative of torque or torque coefficient.  Same format as dP and dCP
-
-
         Notes
         -----
-
         CP = P / (q * Uinf * A)
-
         CT = T / (q * A)
-
         CQ = Q / (q * A * R)
-
         The rotor radius R, may not actually be Rtip if precone and precurve are both nonzero
         ``R = Rtip*cos(precone) + precurveTip*sin(precone)``
-
         """
 
         # rename
@@ -767,6 +1001,7 @@ class CCBlade:
         T = np.zeros(npts)
         Q = np.zeros(npts)
         P = np.zeros(npts)
+        M = np.zeros(npts)
 
         if self.derivatives:
             dT_ds = np.zeros((npts, 11))
@@ -781,7 +1016,13 @@ class CCBlade:
 
                 if not self.derivatives:
                     # contribution from this azimuthal location
-                    Np, Tp = self.distributedAeroLoads(Uinf[i], Omega[i], pitch[i], azimuth)
+                    if self.induction:
+                        a, ap, Np, Tp = self.distributedAeroLoads(Uinf[i], Omega[i], pitch[i], azimuth)
+                        # Induction
+                        self.a  = a
+                        self.ap = ap
+                    else:
+                        Np, Tp = self.distributedAeroLoads(Uinf[i], Omega[i], pitch[i], azimuth)
 
                 else:
 
@@ -796,22 +1037,28 @@ class CCBlade:
                     dQ_dv[i, :, :] += self.B * dQ_dv_sub / nsec
 
 
-                Tsub, Qsub = _bem.thrusttorque(Np, Tp, *args)
+                Tsub, Qsub, Msub = _bem.thrusttorque(Np, Tp, *args)
 
                 T[i] += self.B * Tsub / nsec
                 Q[i] += self.B * Qsub / nsec
+                M[i] += Msub / nsec
 
 
+        
+        
         # Power
         P = Q * Omega*pi/30.0  # RPM to rad/s
-
+        
+        
+        
         # normalize if necessary
-        if coefficient:
+        if coefficients:
             q = 0.5 * self.rho * Uinf**2
             A = pi * self.rotorR**2
             CP = P / (q * A * Uinf)
             CT = T / (q * A)
             CQ = Q / (q * self.rotorR * A)
+            CM = M / (q * self.rotorR * A)
 
             if self.derivatives:
 
@@ -843,10 +1090,7 @@ class CCBlade:
                 # pack derivatives into dictionary
                 dCT, dCQ, dCP = self.__thrustTorqueDictionary(dCT_ds, dCQ_ds, dCP_ds, dCT_dv, dCQ_dv, dCP_dv, npts)
 
-                return CP, CT, CQ, dCP, dCT, dCQ
 
-            else:
-                return CP, CT, CQ
 
 
         if self.derivatives:
@@ -859,11 +1103,19 @@ class CCBlade:
 
             # pack derivatives into dictionary
             dT, dQ, dP = self.__thrustTorqueDictionary(dT_ds, dQ_ds, dP_ds, dT_dv, dQ_dv, dP_dv, npts)
-
-            return P, T, Q, dP, dT, dQ
-
+        
+        
+        if coefficients:
+            if self.derivatives:
+                return P, T, Q, M, dP, dT, dQ, CP, CT, CQ, CM, dCP, dCT, dCQ
+            else:
+                return P, T, Q, M, CP, CT, CQ, CM
         else:
-            return P, T, Q
+            if self.derivatives:
+                return P, T, Q, M, dP, dT, dQ
+            else:
+                return P, T, Q, M
+
 
 
 
@@ -1078,7 +1330,7 @@ if __name__ == '__main__':
 
     CP, CT, CQ = aeroanalysis.evaluate([Uinf], [Omega], [pitch], coefficient=True)
 
-    print CP, CT, CQ
+    print(CP, CT, CQ)
 
 
     tsr = np.linspace(2, 14, 50)
